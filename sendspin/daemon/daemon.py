@@ -14,6 +14,7 @@ from aiohttp import ClientError, web
 from aiosendspin.client import ClientListener, PairingSupport, SendspinClient
 from aiosendspin.models.core import GroupUpdateServerPayload, ServerCommandPayload
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.source import ClientHelloSourceSupport
 from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
 from aiosendspin.models.types import (
     Activity,
@@ -28,6 +29,7 @@ from sendspin.audio_devices import AudioDevice, detect_supported_audio_formats
 from sendspin.audio_connector import AudioStreamHandler
 from sendspin.hooks import run_hook
 from sendspin.settings import ClientSettings
+from sendspin.source_connector import SourceHandler
 from sendspin.utils import create_task, get_device_info
 
 if TYPE_CHECKING:
@@ -42,11 +44,11 @@ logger = logging.getLogger(__name__)
 class DaemonArgs:
     """Configuration for the Sendspin daemon."""
 
-    audio_device: AudioDevice
     identity: Identity
     pairing_store: ClientPairingStore
     client_name: str
     settings: ClientSettings
+    audio_device: AudioDevice | None = None
     url: str | None = None
     static_delay_ms: float | None = None
     listen_port: int = 8928
@@ -58,6 +60,13 @@ class DaemonArgs:
     manufacturer: str | None = None
     product_name: str | None = None
     interface: str | None = None
+    player_enabled: bool = True
+    source_enabled: bool = False
+    source_device: AudioDevice | None = None
+    source_codec: str = "flac"
+    source_sample_rate: int = 48000
+    source_channels: int = 2
+    source_bit_depth: int = 16
 
 
 class SendspinDaemon:
@@ -74,6 +83,7 @@ class SendspinDaemon:
         self._client: SendspinClient | None = None
         self._listener: ClientListener | None = None
         self._audio_handler: AudioStreamHandler | None = None
+        self._source_handler: SourceHandler | None = None
         self._settings = args.settings
         self._mpris: SendspinMpris | None = None
         # Currently-applied static delay in milliseconds, mirroring
@@ -89,15 +99,38 @@ class SendspinDaemon:
 
     def _create_client(self) -> SendspinClient:
         """Create a new SendspinClient instance."""
-        assert self._audio_handler is not None
-        client_roles = [Roles.PLAYER]
-        if MPRIS_AVAILABLE and self._args.use_mpris:
+        client_roles = []
+        if self._args.player_enabled:
+            client_roles.append(Roles.PLAYER)
+        if MPRIS_AVAILABLE and self._args.use_mpris and self._args.player_enabled:
             client_roles.extend([Roles.METADATA, Roles.CONTROLLER])
+        if self._args.source_enabled:
+            client_roles.append(Roles.SOURCE)
 
-        supported_formats = detect_supported_audio_formats(self._args.audio_device)
-        if self._args.preferred_format is not None:
-            supported_formats = [f for f in supported_formats if f != self._args.preferred_format]
-            supported_formats.insert(0, self._args.preferred_format)
+        player_support = None
+        if self._args.player_enabled:
+            supported_formats = (
+                detect_supported_audio_formats(self._args.audio_device)
+                if self._args.audio_device
+                else []
+            )
+            if self._args.preferred_format is not None:
+                supported_formats = [
+                    f for f in supported_formats if f != self._args.preferred_format
+                ]
+                supported_formats.insert(0, self._args.preferred_format)
+            player_support = ClientHelloPlayerSupport(
+                supported_formats=supported_formats,
+                buffer_capacity=32_000_000,
+                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+            )
+
+        source_support = ClientHelloSourceSupport() if self._args.source_enabled else None
+        initial_volume = self._audio_handler.volume if self._audio_handler is not None else 100
+        initial_muted = self._audio_handler.muted if self._audio_handler is not None else False
+        state_supported_commands = (
+            [PlayerCommand.SET_STATIC_DELAY] if self._args.player_enabled else []
+        )
 
         return SendspinClient(
             identity=self._args.identity,
@@ -109,15 +142,12 @@ class SendspinDaemon:
                 manufacturer=self._args.manufacturer,
                 product_name=self._args.product_name,
             ),
-            player_support=ClientHelloPlayerSupport(
-                supported_formats=supported_formats,
-                buffer_capacity=32_000_000,
-                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
-            ),
-            static_delay_ms=self._static_delay_ms,
-            state_supported_commands=[PlayerCommand.SET_STATIC_DELAY],
-            initial_volume=self._audio_handler.volume,
-            initial_muted=self._audio_handler.muted,
+            player_support=player_support,
+            source_support=source_support,
+            static_delay_ms=self._static_delay_ms if self._args.player_enabled else 0.0,
+            state_supported_commands=state_supported_commands,
+            initial_volume=initial_volume,
+            initial_muted=initial_muted,
         )
 
     def _build_pairing_support(self) -> PairingSupport:
@@ -162,17 +192,29 @@ class SendspinDaemon:
         )
         self._static_delay_ms = max(0.0, min(5000.0, delay))
 
-        self._audio_handler = AudioStreamHandler(
-            audio_device=self._args.audio_device,
-            volume=self._settings.player_volume,
-            muted=self._settings.player_muted,
-            on_event=self._on_stream_event,
-            on_format_change=self._handle_format_change,
-            on_volume_change=self._on_volume_change,
-            volume_controller=self._args.volume_controller,
-        )
-        await self._audio_handler.read_initial_volume()
-        await self._audio_handler.start_volume_monitor()
+        if self._args.player_enabled:
+            assert self._args.audio_device is not None
+            self._audio_handler = AudioStreamHandler(
+                audio_device=self._args.audio_device,
+                volume=self._settings.player_volume,
+                muted=self._settings.player_muted,
+                on_event=self._on_stream_event,
+                on_format_change=self._handle_format_change,
+                on_volume_change=self._on_volume_change,
+                volume_controller=self._args.volume_controller,
+            )
+            await self._audio_handler.read_initial_volume()
+            await self._audio_handler.start_volume_monitor()
+
+        if self._args.source_enabled:
+            self._source_handler = SourceHandler(
+                audio_device=self._args.source_device,
+                codec=self._args.source_codec,
+                sample_rate=self._args.source_sample_rate,
+                channels=self._args.source_channels,
+                bit_depth=self._args.source_bit_depth,
+                on_event=self._on_stream_event,
+            )
 
         try:
             if self._args.url is not None:
@@ -189,6 +231,9 @@ class SendspinDaemon:
                 self._mpris = None
             if self._audio_handler is not None:
                 await self._audio_handler.shutdown()
+            if self._source_handler is not None:
+                await self._source_handler.shutdown()
+                self._source_handler = None
             if self._client is not None:
                 await self._client.disconnect()
                 self._client = None
@@ -204,15 +249,16 @@ class SendspinDaemon:
     def _on_volume_change(self, volume: int, muted: bool) -> None:
         """Handle volume changes from any source (server command, external, etc.)."""
         assert self._settings is not None
-        assert self._audio_handler is not None
 
-        if not self._audio_handler.uses_external_volume_controller:
+        if (
+            self._audio_handler is not None
+            and not self._audio_handler.uses_external_volume_controller
+        ):
             self._settings.update(player_volume=volume, player_muted=muted)
 
     async def _run_client_initiated(self) -> None:
         """Run in client-initiated mode, connecting to a specific URL."""
         assert self._args.url is not None
-        assert self._audio_handler is not None
         client = self._create_client()
         self._server_url = self._args.url
         self._attach_client(client)
@@ -241,10 +287,12 @@ class SendspinDaemon:
             await asyncio.sleep(3600)
 
     def _attach_client(self, client: SendspinClient) -> None:
-        """Attach listeners, audio handler, and MPRIS to a client."""
-        assert self._audio_handler is not None
+        """Attach listeners, audio handler, source handler, and MPRIS to a client."""
         self._client = client
-        self._audio_handler.attach_client(client)
+        if self._audio_handler is not None:
+            self._audio_handler.attach_client(client)
+        if self._source_handler is not None:
+            self._source_handler.attach_client(client)
         self._server_command_unsubscribe = client.add_server_command_listener(
             self._handle_server_command
         )
@@ -252,12 +300,12 @@ class SendspinDaemon:
         self._pairing_abort_unsubscribe = client.add_pairing_abort_listener(
             self._handle_pairing_abort
         )
-        if MPRIS_AVAILABLE and self._args.use_mpris:
+        if MPRIS_AVAILABLE and self._args.use_mpris and self._args.player_enabled:
             self._mpris = SendspinMpris(client)
             self._mpris.start()
 
     def _detach_client(self) -> None:
-        """Detach listeners, audio handler, and MPRIS from the current client."""
+        """Detach listeners, audio handler, source handler, and MPRIS from the current client."""
         if self._server_command_unsubscribe is not None:
             self._server_command_unsubscribe()
             self._server_command_unsubscribe = None
@@ -270,13 +318,17 @@ class SendspinDaemon:
         if self._mpris is not None:
             self._mpris.stop()
             self._mpris = None
+        if self._source_handler is not None:
+            self._source_handler.detach_client()
         if self._audio_handler is not None:
             self._audio_handler.detach_client()
 
     async def _handle_disconnect(self) -> None:
-        """Reset audio state after a connection drop."""
+        """Reset audio and source state after a connection drop."""
         if self._audio_handler is not None:
             await self._audio_handler.handle_disconnect()
+        if self._source_handler is not None:
+            await self._source_handler.handle_disconnect()
 
     def _should_switch_to_new_server(
         self, old_client: SendspinClient, new_client: SendspinClient
@@ -328,7 +380,6 @@ class SendspinDaemon:
         aiosendspin's own tests use for server-initiated dials.
         """
         logger.info("Server connected")
-        assert self._audio_handler is not None
         assert self._connection_lock is not None
         assert self._settings is not None
 
@@ -410,7 +461,6 @@ class SendspinDaemon:
     async def _connection_loop(self, url: str) -> None:
         """Run the connection loop with automatic reconnection (client-initiated mode)."""
         assert self._client is not None
-        assert self._audio_handler is not None
         assert self._settings is not None
         error_backoff = 1.0
         max_backoff = 300.0
@@ -449,10 +499,9 @@ class SendspinDaemon:
 
     def _handle_server_command(self, payload: ServerCommandPayload) -> None:
         """Handle server commands for player volume/mute control."""
-        if payload.player is None or self._settings is None:
+        if payload.player is None or self._settings is None or self._audio_handler is None:
             return
 
-        assert self._audio_handler is not None
         player_cmd = payload.player
 
         if player_cmd.command == PlayerCommand.VOLUME and player_cmd.volume is not None:

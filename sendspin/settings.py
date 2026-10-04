@@ -135,6 +135,14 @@ class ClientSettings(BaseSettings):
     interface: str | None = None
     # User-selected color theme ("dark" or "light"), re-engaged on next palette.
     color_mode: str | None = None
+    # Source settings
+    player_enabled: bool = True
+    source_enabled: bool = False
+    source_audio_device: str | None = None
+    source_codec: str = "flac"
+    source_sample_rate: int = 48000
+    source_channels: int = 2
+    source_bit_depth: int = 16
 
     def update(
         self,
@@ -157,6 +165,13 @@ class ClientSettings(BaseSettings):
         last_played_server_id: str | None = None,
         interface: str | None = None,
         color_mode: str | None = None,
+        player_enabled: bool | None = None,
+        source_enabled: bool | None = None,
+        source_audio_device: str | None = None,
+        source_codec: str | None = None,
+        source_sample_rate: int | None = None,
+        source_channels: int | None = None,
+        source_bit_depth: int | None = None,
     ) -> None:
         """Update settings fields. Only changed fields trigger a save."""
         changed = False
@@ -189,6 +204,13 @@ class ClientSettings(BaseSettings):
                     "last_played_server_id": last_played_server_id,
                     "interface": interface,
                     "color_mode": color_mode,
+                    "player_enabled": player_enabled,
+                    "source_enabled": source_enabled,
+                    "source_audio_device": source_audio_device,
+                    "source_codec": source_codec,
+                    "source_sample_rate": source_sample_rate,
+                    "source_channels": source_channels,
+                    "source_bit_depth": source_bit_depth,
                 }
             )
             or changed
@@ -231,6 +253,13 @@ class ClientSettings(BaseSettings):
             self.last_played_server_id = data.get("last_played_server_id")
             self.interface = data.get("interface")
             self.color_mode = data.get("color_mode")
+            self.player_enabled = data.get("player_enabled", True)
+            self.source_enabled = data.get("source_enabled", False)
+            self.source_audio_device = data.get("source_audio_device")
+            self.source_codec = data.get("source_codec", "flac")
+            self.source_sample_rate = data.get("source_sample_rate", 48000)
+            self.source_channels = data.get("source_channels", 2)
+            self.source_bit_depth = data.get("source_bit_depth", 16)
             logger.info(
                 "Loaded settings from %s: volume=%d%%, muted=%s",
                 self._settings_file,

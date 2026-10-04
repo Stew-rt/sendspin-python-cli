@@ -31,6 +31,7 @@ from aiosendspin.models.player import (
     PlayerCommandPayload,
     SupportedAudioFormat,
 )
+from aiosendspin.models.source import ClientHelloSourceSupport
 from aiosendspin.models.types import (
     ArtworkSource,
     MediaCommand,
@@ -58,6 +59,7 @@ from sendspin.audio_devices import AudioDevice, detect_supported_audio_formats
 from sendspin.discovery import DiscoveredServer, ServiceDiscovery
 from sendspin.hooks import run_hook
 from sendspin.settings import ClientSettings
+from sendspin.source_connector import SourceHandler
 from sendspin.tui.artwork import detect_support as detect_artwork_support
 from sendspin.tui.keyboard import keyboard_loop
 from sendspin.tui.ui import ColorMode, SendspinUI
@@ -97,6 +99,7 @@ class AppState:
     group_id: str | None = None
     repeat_mode: RepeatMode | None = None
     shuffle: bool | None = None
+    source_streaming: bool = False
 
     def update_metadata(self, metadata: SessionUpdateMetadata) -> bool:
         """Merge new metadata into the state and report if anything changed."""
@@ -235,11 +238,11 @@ class ConnectionManager:
 class AppArgs:
     """Configuration for the Sendspin application."""
 
-    audio_device: AudioDevice
     identity: Identity
     pairing_store: ClientPairingStore
     client_name: str
     settings: ClientSettings
+    audio_device: AudioDevice | None = None
     url: str | None = None
     url_from_settings: bool = False
     static_delay_ms: float | None = None
@@ -251,6 +254,13 @@ class AppArgs:
     manufacturer: str | None = None
     product_name: str | None = None
     interface: str | None = None
+    player_enabled: bool = True
+    source_enabled: bool = False
+    source_device: AudioDevice | None = None
+    source_codec: str = "flac"
+    source_sample_rate: int = 48000
+    source_channels: int = 2
+    source_bit_depth: int = 16
 
 
 class SendspinApp:
@@ -270,6 +280,7 @@ class SendspinApp:
 
         self._client: SendspinClient | None = None
         self._audio_handler: AudioStreamHandler | None = None
+        self._source_handler: SourceHandler | None = None
         self._visualizer_handler: VisualizerHandler | None = None
         self._beat_handler: BeatHandler | None = None
         self._peak_handler: PeakHandler | None = None
@@ -283,6 +294,7 @@ class SendspinApp:
         # because CLI overrides aren't persisted to settings, so
         # `settings.static_delay_ms` can lag the value actually given to the client.
         self._applied_delay_ms: float = 0.0
+        self._supported_formats: list[SupportedAudioFormat] = []
         interfaces = [args.interface] if args.interface else None
         self._discovery = ServiceDiscovery(interfaces=interfaces)
         self._connection_manager = ConnectionManager(self._discovery)
@@ -322,18 +334,41 @@ class SendspinApp:
     def _create_client(self) -> SendspinClient:
         """Create a new SendspinClient with roles based on current visualizer state."""
         args = self._args
-        roles = [Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA, Roles.COLOR]
+        roles: list[Roles] = []
+        if args.player_enabled:
+            roles.extend([Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA, Roles.COLOR])
+        if args.source_enabled:
+            roles.append(Roles.SOURCE)
+
         visualizer_support = None
-        if self._visualizer_enabled:
+        if args.player_enabled and self._visualizer_enabled:
             visualizer_support = self._build_visualizer_support()
             roles.append(Roles.VISUALIZER)
 
         artwork_support: ClientHelloArtworkSupport | None = None
-        if self._supports_artwork:
+        if args.player_enabled and self._supports_artwork:
             artwork_support = self._build_artwork_support()
             roles.append(Roles.ARTWORK)
 
-        assert self._audio_handler is not None
+        source_support = ClientHelloSourceSupport() if args.source_enabled else None
+
+        player_support = None
+        if args.player_enabled:
+            supported_formats = self._supported_formats
+            if not supported_formats and args.audio_device:
+                supported_formats = detect_supported_audio_formats(args.audio_device)
+                if args.preferred_format is not None:
+                    supported_formats = [f for f in supported_formats if f != args.preferred_format]
+                    supported_formats.insert(0, args.preferred_format)
+            player_support = ClientHelloPlayerSupport(
+                supported_formats=supported_formats,
+                buffer_capacity=32_000_000,
+                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+            )
+
+        initial_volume = self._audio_handler.volume if self._audio_handler is not None else 100
+        initial_muted = self._audio_handler.muted if self._audio_handler is not None else False
+        state_supported_commands = [PlayerCommand.SET_STATIC_DELAY] if args.player_enabled else []
 
         return SendspinClient(
             identity=args.identity,
@@ -345,17 +380,14 @@ class SendspinApp:
                 manufacturer=args.manufacturer,
                 product_name=args.product_name,
             ),
-            player_support=ClientHelloPlayerSupport(
-                supported_formats=self._supported_formats,
-                buffer_capacity=32_000_000,
-                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
-            ),
+            player_support=player_support,
+            source_support=source_support,
             visualizer_support=visualizer_support,
             artwork_support=artwork_support,
-            static_delay_ms=self._applied_delay_ms,
-            state_supported_commands=[PlayerCommand.SET_STATIC_DELAY],
-            initial_volume=self._audio_handler.volume,
-            initial_muted=self._audio_handler.muted,
+            static_delay_ms=self._applied_delay_ms if args.player_enabled else 0.0,
+            state_supported_commands=state_supported_commands,
+            initial_volume=initial_volume,
+            initial_muted=initial_muted,
         )
 
     def _build_pairing_support(self) -> PairingSupport:
@@ -373,7 +405,6 @@ class SendspinApp:
     def _attach_client(self) -> None:
         """Attach listeners, audio handler, visualizer, and MPRIS to the current client."""
         assert self._client is not None
-        assert self._audio_handler is not None
 
         self._listener_unsubscribes = [
             self._client.add_metadata_listener(self._handle_metadata_update),
@@ -383,12 +414,15 @@ class SendspinApp:
             self._client.add_color_listener(self._handle_color_update),
             self._client.add_pairing_abort_listener(self._handle_pairing_abort),
         ]
-        self._audio_handler.attach_client(self._client)
+        if self._audio_handler is not None:
+            self._audio_handler.attach_client(self._client)
+        if self._source_handler is not None:
+            self._source_handler.attach_client(self._client)
 
-        if self._ui is not None:
+        if self._ui is not None and self._args.player_enabled:
             self._ui.set_visualizer_enabled(self._visualizer_enabled)
 
-        if self._visualizer_enabled:
+        if self._args.player_enabled and self._visualizer_enabled:
             self._visualizer_handler = VisualizerHandler(
                 on_frame=self._handle_visualizer_frame,
             )
@@ -409,24 +443,25 @@ class SendspinApp:
             if self._ui is not None:
                 self._ui.set_server_clock(self._server_now_us)
 
-        if self._supports_artwork:
+        if self._args.player_enabled and self._supports_artwork:
             self._artwork_handler = ArtworkHandler(
                 on_image=self._handle_artwork_update,
             )
             self._artwork_handler.attach_client(self._client)
 
-        if MPRIS_AVAILABLE and self._args.use_mpris:
+        if MPRIS_AVAILABLE and self._args.use_mpris and self._args.player_enabled:
             self._mpris = SendspinMpris(self._client)
             self._mpris.start()
 
     def _detach_client(self) -> None:
         """Detach listeners, audio handler, visualizer, and MPRIS from the current client."""
-        assert self._audio_handler is not None
-
         for unsub in self._listener_unsubscribes:
             unsub()
         self._listener_unsubscribes = []
-        self._audio_handler.detach_client()
+        if self._source_handler is not None:
+            self._source_handler.detach_client()
+        if self._audio_handler is not None:
+            self._audio_handler.detach_client()
         # Drop the per-server palette so a non-color server reverts to unthemed.
         if self._ui is not None:
             self._ui.reset_palette()
@@ -483,43 +518,74 @@ class SendspinApp:
             )
             self._applied_delay_ms = max(0.0, min(5000.0, delay))
 
-            self._audio_handler = AudioStreamHandler(
-                audio_device=args.audio_device,
-                volume=self._settings.player_volume,
-                muted=self._settings.player_muted,
-                on_event=self._on_stream_event,
-                on_format_change=self._handle_format_change,
-                on_volume_change=self._on_volume_change,
-                volume_controller=args.volume_controller,
-            )
-            await self._audio_handler.read_initial_volume()
+            if args.player_enabled:
+                assert args.audio_device is not None
+                self._audio_handler = AudioStreamHandler(
+                    audio_device=args.audio_device,
+                    volume=self._settings.player_volume,
+                    muted=self._settings.player_muted,
+                    on_event=self._on_stream_event,
+                    on_format_change=self._handle_format_change,
+                    on_volume_change=self._on_volume_change,
+                    volume_controller=args.volume_controller,
+                )
+                await self._audio_handler.read_initial_volume()
+                self._state.player_volume = self._audio_handler.volume
+                self._state.player_muted = self._audio_handler.muted
 
-            self._state.player_volume = self._audio_handler.volume
-            self._state.player_muted = self._audio_handler.muted
+                # Detect supported audio formats for the output device
+                supported_formats = (
+                    detect_supported_audio_formats(args.audio_device) if args.audio_device else []
+                )
+                if args.preferred_format is not None:
+                    supported_formats = [f for f in supported_formats if f != args.preferred_format]
+                    supported_formats.insert(0, args.preferred_format)
+                self._supported_formats = supported_formats
 
-            # Detect supported audio formats for the output device
-            supported_formats = detect_supported_audio_formats(args.audio_device)
-            if args.preferred_format is not None:
-                supported_formats = [f for f in supported_formats if f != args.preferred_format]
-                supported_formats.insert(0, args.preferred_format)
-            self._supported_formats = supported_formats
+            if args.source_enabled:
+                self._source_handler = SourceHandler(
+                    audio_device=args.source_device,
+                    codec=args.source_codec,
+                    sample_rate=args.source_sample_rate,
+                    channels=args.source_channels,
+                    bit_depth=args.source_bit_depth,
+                    on_state_change=self._on_source_state_change,
+                    on_event=self._on_source_event,
+                    on_error=self._on_source_error,
+                )
 
             self._client = self._create_client()
 
-            await self._audio_handler.start_volume_monitor()
+            if self._audio_handler is not None:
+                await self._audio_handler.start_volume_monitor()
 
+            source_dev_name = args.source_device.name if args.source_device else "Default"
             self._ui = SendspinUI(
-                self._applied_delay_ms,
-                player_volume=self._audio_handler.volume,
-                player_muted=self._audio_handler.muted,
-                use_external_volume=self._audio_handler.uses_external_volume_controller,
-                visualizer_enabled=self._visualizer_enabled,
+                self._applied_delay_ms if args.player_enabled else 0.0,
+                player_enabled=args.player_enabled,
+                player_volume=self._audio_handler.volume if self._audio_handler else 100,
+                player_muted=self._audio_handler.muted if self._audio_handler else False,
+                use_external_volume=(
+                    self._audio_handler.uses_external_volume_controller
+                    if self._audio_handler
+                    else False
+                ),
+                visualizer_enabled=self._visualizer_enabled if args.player_enabled else False,
                 color_mode=ColorMode.parse(self._settings.color_mode),
                 on_color_mode_change=self._persist_color_mode,
+                source_enabled=args.source_enabled,
+                source_device_name=source_dev_name,
+                source_codec=args.source_codec,
+                source_sample_rate=args.source_sample_rate,
+                source_bit_depth=args.source_bit_depth,
+                source_channels=args.source_channels,
             )
             self._ui.start()
             self._ui.add_event(f"Using client ID: {args.identity.peer_id}")
-            self._ui.add_event(f"Using audio device: {args.audio_device.name}")
+            if args.player_enabled and args.audio_device:
+                self._ui.add_event(f"Using audio device: {args.audio_device.name}")
+            if args.source_enabled:
+                self._ui.add_event(f"Using source device: {source_dev_name}")
 
             await self._discovery.start()
 
@@ -589,6 +655,9 @@ class SendspinApp:
         finally:
             if self._mpris:
                 self._mpris.stop()
+            if self._source_handler:
+                await self._source_handler.shutdown()
+                self._source_handler = None
             if self._visualizer_handler:
                 self._visualizer_handler.detach()
             if self._beat_handler:
@@ -608,27 +677,29 @@ class SendspinApp:
 
     def _on_volume_change(self, volume: int, muted: bool) -> None:
         """Handle volume changes from any source (server command, keyboard, external)."""
-        assert self._audio_handler is not None
-        assert self._ui is not None
-
         self._state.player_volume = volume
         self._state.player_muted = muted
-        self._ui.set_player_volume(volume, muted=muted)
-        if not self._audio_handler.uses_external_volume_controller:
+        if self._ui is not None:
+            self._ui.set_player_volume(volume, muted=muted)
+        if (
+            self._audio_handler is not None
+            and not self._audio_handler.uses_external_volume_controller
+        ):
             self._settings.update(player_volume=volume, player_muted=muted)
 
     async def _handle_disconnect(self, message: str) -> None:
         """Update UI and reset connection-scoped audio state after a disconnect."""
-        assert self._audio_handler is not None
-        assert self._ui is not None
-
         logger.info(message)
-        self._ui.add_event(message)
-        self._ui.set_disconnected(message)
+        if self._ui is not None:
+            self._ui.add_event(message)
+            self._ui.set_disconnected(message)
         if self._visualizer_handler:
             self._visualizer_handler.reset()
         self._clear_visualizer_timelines()
-        await self._audio_handler.handle_disconnect()
+        if self._audio_handler is not None:
+            await self._audio_handler.handle_disconnect()
+        if self._source_handler is not None:
+            await self._source_handler.handle_disconnect()
 
     async def _connect_cancellable(self, url: str) -> None:
         """Connect to server. Can be cancelled by _cancel_connect().
@@ -683,7 +754,6 @@ class SendspinApp:
         """
         assert self._state.selected_server
         assert self._client is not None
-        assert self._audio_handler is not None
         assert self._ui is not None
         manager = self._connection_manager
         ui = self._ui
@@ -896,10 +966,9 @@ class SendspinApp:
 
     def _handle_server_command(self, payload: ServerCommandPayload) -> None:
         """Handle server/command messages for player volume/mute control."""
-        if payload.player is None:
+        if payload.player is None or self._audio_handler is None:
             return
 
-        assert self._audio_handler is not None
         assert self._ui is not None
         player_cmd: PlayerCommandPayload = payload.player
 
@@ -918,7 +987,6 @@ class SendspinApp:
             # Client library already applied the delay change;
             # notify audio worker so sync correction adjusts timing gradually
             assert self._client is not None
-            assert self._audio_handler is not None
             new_delay_ms = self._client.static_delay_ms
             delta_us = int((new_delay_ms - self._applied_delay_ms) * 1000)
             if delta_us != 0:
@@ -1046,3 +1114,38 @@ class SendspinApp:
                 client_name=self._args.client_name,
             )
         )
+
+    def _on_source_state_change(self, is_streaming: bool) -> None:
+        """Handle source streaming state changes by updating UI."""
+        self._state.source_streaming = is_streaming
+        if self._ui is not None:
+            self._ui.set_source_streaming(is_streaming)
+
+    def _on_source_event(self, event: str) -> None:
+        """Handle source stream lifecycle events."""
+        if self._ui is not None:
+            status_text = "streaming started" if event == "start" else "streaming stopped"
+            self._ui.add_event(f"Source {status_text}")
+        hook = self._args.hook_start if event == "start" else self._args.hook_stop
+        if not hook:
+            return
+        if self._client is not None:
+            server = self._state.selected_server
+            server_info = self._client.server_info
+            create_task(
+                run_hook(
+                    hook,
+                    event=f"source_{event}",
+                    server_id=server_info.server_id if server_info else None,
+                    server_name=server_info.name if server_info else None,
+                    server_url=server.url if server else None,
+                    client_id=self._args.identity.peer_id,
+                    client_name=self._args.client_name,
+                )
+            )
+
+    def _on_source_error(self, exc: Exception) -> None:
+        """Handle source capture/streaming errors."""
+        logger.error("Source error: %s", exc)
+        if self._ui is not None:
+            self._ui.add_event(f"Source error: {exc}")

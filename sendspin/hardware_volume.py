@@ -89,7 +89,10 @@ async def _get_sink(audio_device: AudioDevice, client: pulsectl_asyncio.PulseAsy
         logger.error("Hardware volume: no PulseAudio sinks available")
         return None
 
-    if audio_device.is_default or audio_device.name in (
+    is_default = getattr(
+        audio_device, "is_default_output", getattr(audio_device, "is_default", False)
+    )
+    if is_default or audio_device.name in (
         "default",
         "pipewire",
         "pulse",

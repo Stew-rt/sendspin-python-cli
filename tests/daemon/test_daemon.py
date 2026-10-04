@@ -4,9 +4,11 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-from aiosendspin.models.types import PlayerCommand
+import pytest
+from aiosendspin.models.types import PlayerCommand, Roles
 from aiosendspin.noise import Identity, InMemoryClientPairingStore
 
+from sendspin.audio_devices import AudioDevice
 from sendspin.daemon.daemon import DaemonArgs, SendspinDaemon
 from sendspin.settings import ClientSettings
 
@@ -17,6 +19,19 @@ class _FakeAudioHandler:
         self.muted = muted
         self.calls: list[tuple[int, bool]] = []
         self.delay_changes: list[int] = []
+        self.attached_client: object | None = None
+        self.detached = False
+        self.disconnected = False
+
+    def attach_client(self, client: object) -> None:
+        self.attached_client = client
+
+    def detach_client(self) -> None:
+        self.detached = True
+        self.attached_client = None
+
+    async def handle_disconnect(self) -> None:
+        self.disconnected = True
 
     def set_volume(self, volume: int, *, muted: bool) -> None:
         self.calls.append((volume, muted))
@@ -102,3 +117,110 @@ def test_set_static_delay_uses_applied_tracker_for_delta(tmp_path: Path) -> None
     assert daemon._audio_handler.delay_changes == [-300_000]
     assert daemon._static_delay_ms == 200.0
     assert daemon._settings.static_delay_ms == 200.0
+
+
+@pytest.mark.asyncio
+async def test_create_client_roles_and_source_support(tmp_path: Path) -> None:
+    settings = ClientSettings(_settings_file=tmp_path / "settings.json")
+    audio_device = AudioDevice(index=0, name="Fake Output", output_channels=2)
+
+    # Disabled source
+    args_no_source = DaemonArgs(
+        audio_device=audio_device,
+        identity=Identity.generate(),
+        pairing_store=InMemoryClientPairingStore(),
+        client_name="Test Player",
+        settings=settings,
+        use_mpris=False,
+        source_enabled=False,
+    )
+    daemon_no_source = SendspinDaemon(args_no_source)
+    daemon_no_source._audio_handler = _FakeAudioHandler(volume=50, muted=False)
+    client_no_source = daemon_no_source._create_client()
+
+    assert Roles.PLAYER in client_no_source.roles
+    assert Roles.SOURCE not in client_no_source.roles
+    assert client_no_source.source_support is None
+
+    # Enabled source
+    source_device = AudioDevice(index=1, name="Fake Input", input_channels=2)
+    args_with_source = DaemonArgs(
+        audio_device=audio_device,
+        identity=Identity.generate(),
+        pairing_store=InMemoryClientPairingStore(),
+        client_name="Test Source Player",
+        settings=settings,
+        use_mpris=False,
+        source_enabled=True,
+        source_device=source_device,
+        source_codec="opus",
+        source_sample_rate=44100,
+        source_channels=1,
+        source_bit_depth=24,
+    )
+    daemon_with_source = SendspinDaemon(args_with_source)
+    daemon_with_source._audio_handler = _FakeAudioHandler(volume=50, muted=False)
+    client_with_source = daemon_with_source._create_client()
+
+    assert Roles.PLAYER in client_with_source.roles
+    assert Roles.SOURCE in client_with_source.roles
+    assert client_with_source.source_support is not None
+
+
+class _FakeSourceHandler:
+    def __init__(self) -> None:
+        self.attached_client: object | None = None
+        self.detached = False
+        self.disconnected = False
+        self.shutdown_called = False
+
+    def attach_client(self, client: object) -> None:
+        self.attached_client = client
+
+    def detach_client(self) -> None:
+        self.detached = True
+        self.attached_client = None
+
+    async def handle_disconnect(self) -> None:
+        self.disconnected = True
+
+    async def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+@pytest.mark.asyncio
+async def test_source_handler_lifecycle_in_daemon(tmp_path: Path) -> None:
+    settings = ClientSettings(_settings_file=tmp_path / "settings.json")
+    audio_device = AudioDevice(index=0, name="Fake Output", output_channels=2)
+    args = DaemonArgs(
+        audio_device=audio_device,
+        identity=Identity.generate(),
+        pairing_store=InMemoryClientPairingStore(),
+        client_name="Test Source Daemon",
+        settings=settings,
+        use_mpris=False,
+        source_enabled=True,
+    )
+    daemon = SendspinDaemon(args)
+    fake_audio = _FakeAudioHandler(volume=50, muted=False)
+    fake_source = _FakeSourceHandler()
+    daemon._audio_handler = fake_audio
+    daemon._source_handler = fake_source  # type: ignore[assignment]
+
+    fake_client = SimpleNamespace(
+        add_server_command_listener=lambda cb: (lambda: None),
+        add_group_update_listener=lambda cb: (lambda: None),
+        add_pairing_abort_listener=lambda cb: (lambda: None),
+    )
+
+    # Attach
+    daemon._attach_client(fake_client)  # type: ignore[arg-type]
+    assert fake_source.attached_client is fake_client
+
+    # Disconnect
+    await daemon._handle_disconnect()
+    assert fake_source.disconnected is True
+
+    # Detach
+    daemon._detach_client()
+    assert fake_source.detached is True

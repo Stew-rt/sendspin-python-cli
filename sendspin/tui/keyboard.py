@@ -29,7 +29,7 @@ class CommandHandler:
         self,
         get_client: Callable[[], SendspinClient | None],
         state: AppState,
-        audio_handler: AudioStreamHandler,
+        audio_handler: AudioStreamHandler | None,
         ui: SendspinUI,
         settings: ClientSettings,
         on_delay_changed: Callable[[float], None] | None = None,
@@ -60,12 +60,16 @@ class CommandHandler:
 
     def change_player_volume(self, delta: int) -> None:
         """Adjust player (local) volume by delta."""
+        if self._audio_handler is None:
+            return
         target = max(0, min(100, self._audio_handler.volume + delta))
         self._audio_handler.set_volume(target, muted=self._audio_handler.muted)
         self._ui.add_event(f"Player volume: {target}%")
 
     def toggle_player_mute(self) -> None:
         """Toggle player (local) mute state."""
+        if self._audio_handler is None:
+            return
         muted = not self._audio_handler.muted
         self._audio_handler.set_volume(self._audio_handler.volume, muted=muted)
         self._ui.add_event("Player muted" if muted else "Player unmuted")
@@ -118,13 +122,14 @@ class CommandHandler:
         new_delay = max(0, min(5000, old_delay + delta))
         client.set_static_delay_ms(new_delay)
         actual_delta_us = int((client.static_delay_ms - old_delay) * 1000)
-        if actual_delta_us != 0:
+        if actual_delta_us != 0 and self._audio_handler is not None:
             self._audio_handler.notify_delay_change(actual_delta_us)
         self._ui.set_delay(client.static_delay_ms)
         self._settings.update(static_delay_ms=client.static_delay_ms)
         if self._on_delay_changed is not None:
             self._on_delay_changed(client.static_delay_ms)
-        self._audio_handler.send_player_volume()
+        if self._audio_handler is not None:
+            self._audio_handler.send_player_volume()
 
     def close_server_selector(self) -> None:
         """Close the server selector panel."""
@@ -134,7 +139,7 @@ class CommandHandler:
 async def keyboard_loop(
     get_client: Callable[[], SendspinClient | None],
     state: AppState,
-    audio_handler: AudioStreamHandler,
+    audio_handler: AudioStreamHandler | None,
     ui: SendspinUI,
     settings: ClientSettings,
     show_server_selector: Callable[[], None],
@@ -170,35 +175,41 @@ async def keyboard_loop(
 
     # Key dispatch table: key -> (highlight_name | None, action)
     # Actions can be sync or async. For keys that need case-insensitive matching, use lowercase.
-    shortcuts: dict[str, tuple[str | None, Callable[[], Awaitable[None] | None]]] = {
-        # Letter keys
-        " ": ("space", handler.toggle_play_pause),
-        "m": ("mute", handler.toggle_player_mute),
-        "g": ("switch", lambda: handler.send_media_command(MediaCommand.SWITCH)),
-        "r": ("repeat", handler.cycle_repeat),
-        "x": ("shuffle", handler.toggle_shuffle),
-        "v": ("visualizer", on_toggle_visualizer),
-        "t": ("theme", ui.cycle_color_mode),
-        # Delay adjustment
-        ",": ("delay-", lambda: handler.adjust_delay(-10)),
-        ".": ("delay+", lambda: handler.adjust_delay(10)),
-        # Group volume/mute (uppercase M matched before lowercase fallback)
-        "M": ("group-mute", handler.toggle_group_mute),
-        # Arrow keys
-        readchar.key.LEFT: (
-            "prev",
-            lambda: handler.send_media_command(MediaCommand.PREVIOUS),
-        ),
-        readchar.key.RIGHT: (
-            "next",
-            lambda: handler.send_media_command(MediaCommand.NEXT),
-        ),
-        readchar.key.UP: ("up", lambda: handler.change_player_volume(5)),
-        readchar.key.DOWN: ("down", lambda: handler.change_player_volume(-5)),
-        # Group volume
-        "]": ("group-up", lambda: handler.change_group_volume(5)),
-        "[": ("group-down", lambda: handler.change_group_volume(-5)),
-    }
+    shortcuts: dict[str, tuple[str | None, Callable[[], Awaitable[None] | None]]]
+    if not ui.state.player_enabled:
+        shortcuts = {
+            "t": ("theme", ui.cycle_color_mode),
+        }
+    else:
+        shortcuts = {
+            # Letter keys
+            " ": ("space", handler.toggle_play_pause),
+            "m": ("mute", handler.toggle_player_mute),
+            "g": ("switch", lambda: handler.send_media_command(MediaCommand.SWITCH)),
+            "r": ("repeat", handler.cycle_repeat),
+            "x": ("shuffle", handler.toggle_shuffle),
+            "v": ("visualizer", on_toggle_visualizer),
+            "t": ("theme", ui.cycle_color_mode),
+            # Delay adjustment
+            ",": ("delay-", lambda: handler.adjust_delay(-10)),
+            ".": ("delay+", lambda: handler.adjust_delay(10)),
+            # Group volume/mute (uppercase M matched before lowercase fallback)
+            "M": ("group-mute", handler.toggle_group_mute),
+            # Arrow keys
+            readchar.key.LEFT: (
+                "prev",
+                lambda: handler.send_media_command(MediaCommand.PREVIOUS),
+            ),
+            readchar.key.RIGHT: (
+                "next",
+                lambda: handler.send_media_command(MediaCommand.NEXT),
+            ),
+            readchar.key.UP: ("up", lambda: handler.change_player_volume(5)),
+            readchar.key.DOWN: ("down", lambda: handler.change_player_volume(-5)),
+            # Group volume
+            "]": ("group-up", lambda: handler.change_group_volume(5)),
+            "[": ("group-down", lambda: handler.change_group_volume(-5)),
+        }
 
     loop = asyncio.get_running_loop()
     key_queue: asyncio.Queue[str] = asyncio.Queue()

@@ -34,6 +34,7 @@ def test_get_sink_matches_selected_alsa_device() -> None:
     client = _FakePulseClient(sinks, default_sink_name="alsa_output.hdmi")
     audio_device = SimpleNamespace(
         is_default=False,
+        is_default_output=False,
         name="USB DAC: Analog Stereo (hw:2,0)",
     )
 

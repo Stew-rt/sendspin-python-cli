@@ -117,7 +117,13 @@ Settings are stored in `~/.config/sendspin/`:
   "hook_set_volume": "/usr/local/bin/set-avr-volume",
   "manufacturer": "Acme Corp",
   "product_name": "Living Room Speaker",
-  "interface": "192.168.1.5"
+  "interface": "192.168.1.5",
+  "source_enabled": false,
+  "source_audio_device": "1",
+  "source_codec": "flac",
+  "source_sample_rate": 48000,
+  "source_channels": 2,
+  "source_bit_depth": 16
 }
 ```
 
@@ -154,6 +160,12 @@ Settings are stored in `~/.config/sendspin/`:
 | `product_name` | string | TUI/daemon | Product name reported in the client hello (`--product-name`); defaults to auto-detected OS/platform name |
 | `interface` | string | TUI/daemon | IP address of the network interface to use (`--interface`) |
 | `visualizer` | boolean | TUI | Render the `visualizer@v1` audio visualizer on launch (default: false). Toggle with `v` in the TUI |
+| `source_enabled` | boolean | TUI/daemon | Enable audio input capture and streaming via `source@v1` (`--input`, `--source`, `--enable-source`) |
+| `source_audio_device` | string | TUI/daemon | Audio input device index, name prefix, or ALSA device name (`--input-device`, `--source-device`) |
+| `source_codec` | string | TUI/daemon | Audio codec for source streaming (`flac`, `opus`, `pcm`; default: `flac`) |
+| `source_sample_rate` | integer | TUI/daemon | Sample rate in Hz for source audio capture (default: 48000) |
+| `source_channels` | integer | TUI/daemon | Number of audio channels for source capture (default: 2) |
+| `source_bit_depth` | integer | TUI/daemon | Bit depth for source audio capture (`16`, `24`, `32`; default: 16) |
 | `source` | string | serve | Default audio source (file path or URL, ffmpeg input) |
 | `source_format` | string | serve | ffmpeg container format for audio source |
 | `clients` | array | serve | Client URLs to connect to (`--client`) |
@@ -220,7 +232,8 @@ By default, the player uses your system's default audio output device. You can l
 
 **List available audio devices:**
 ```bash
-sendspin audio-devices list
+sendspin audio-devices list           # Output (playback) devices (default)
+sendspin audio-devices list --input   # Input (capture) devices
 ```
 
 This displays all audio output devices with their IDs, channel configurations, and sample rates. The default device is marked.
@@ -253,6 +266,40 @@ sendspin daemon --name "Kitchen" --audio-device kitchen
 This requires an `/etc/asound.conf` with dmix and plug devices that route to the appropriate channels. See your ALSA documentation for details on configuring dmix.
 
 This is particularly useful when running `sendspin daemon` on headless devices or when you want to route audio to a specific output.
+
+### Audio Input (Source) Streaming
+
+Sendspin can act as an audio source (`source@v1` role), capturing local audio input (such as a turntable, line-in port, or USB audio interface) and streaming time-synchronized audio over the network to a Sendspin server. When `--input` is specified, player features (playback, volume, visualizer) are disabled, and the interactive TUI only displays UI elements relevant to input streaming.
+
+**Enable audio source mode:**
+```bash
+sendspin --input
+sendspin daemon --input
+```
+
+**List available audio input (capture) devices:**
+```bash
+sendspin audio-devices list --input
+```
+
+**Specify input device, codec, and format options:**
+```bash
+# Capture from a specific USB interface using FLAC (default)
+sendspin --input --input-device "USB Audio" --source-codec flac
+
+# Capture at 48kHz, 24-bit stereo using Opus encoding
+sendspin daemon --input --input-device 1 --source-codec opus --source-rate 48000 --source-bit-depth 24 --source-channels 2
+```
+
+Available source options:
+- `--input` / `--source` / `--enable-source`: Enable audio input capture/streaming mode and disable player features
+- `--input-device` / `--source-device`: Audio input device by index, name prefix, or ALSA identifier
+- `--source-codec`: Audio encoding format (`flac`, `opus`, or `pcm`; default: `flac`)
+- `--source-rate`: Sample rate in Hz (default: `48000`)
+- `--source-channels`: Number of channels (`1` or `2`; default: `2`)
+- `--source-bit-depth`: Bit depth per sample (`16`, `24`, or `32`; default: `16`)
+
+In the interactive TUI, a real-time **VU Meter** panel displays live channel audio input levels (dBFS scale with peak indicators), and the **Stream** panel indicates the active capture state (`Streaming` or `Idle`) alongside the configured input device and audio stream format. When running as a daemon on headless appliances (such as a Raspberry Pi line-in bridge), audio capture starts and stops automatically when commanded by the server.
 
 ### Preferred Audio Format
 
@@ -340,7 +387,7 @@ sendspin daemon --hook-start "amixer set Master unmute" --hook-stop "amixer set 
 `--hook-set-volume` is separate from these stream lifecycle hooks. It is intended for external volume controllers and receives the effective output volume as its last argument.
 
 Hooks receive these environment variables:
-- `SENDSPIN_EVENT` - Event type: "start" or "stop"
+- `SENDSPIN_EVENT` - Event type: "start", "stop", "source_start", or "source_stop"
 - `SENDSPIN_SERVER_ID` - Connected server identifier
 - `SENDSPIN_SERVER_NAME` - Connected server friendly name
 - `SENDSPIN_SERVER_URL` - Connected server URL. Only available if client initiated the connection to the server.

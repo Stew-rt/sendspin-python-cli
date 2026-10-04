@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.noise import ClientPairingStore, Identity
 
-    from sendspin.audio_devices import AudioDevice
+    from sendspin.audio_devices import AudioDevice, DeviceDirection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,33 +89,42 @@ def _set_pulse_client_metadata() -> None:
         os.environ.setdefault(key, value)
 
 
-def list_audio_devices() -> None:
-    """List all available audio output devices."""
+def list_audio_devices(direction: DeviceDirection | None = None) -> None:
+    """List available audio devices."""
     try:
-        from sendspin.audio_devices import query_devices
+        from sendspin.audio_devices import DeviceDirection, list_alsa_devices, query_devices
     except OSError as e:
         if "PortAudio library not found" in str(e):
             print(PORTAUDIO_NOT_FOUND_MESSAGE)
             sys.exit(1)
         raise
 
-    from sendspin.audio_devices import list_alsa_devices
+    if direction is None:
+        direction = DeviceDirection.OUTPUT
 
     try:
-        devices = query_devices()
+        devices = query_devices(direction=direction)
     except OSError as e:
         if "PortAudio library not found" in str(e):
             print(PORTAUDIO_NOT_FOUND_MESSAGE)
             sys.exit(1)
         raise
 
-    print("Available audio output devices:")
+    dir_title = "input" if direction == DeviceDirection.INPUT else "output"
+
+    print(f"Available audio {dir_title} devices:")
     print()
     for device in devices:
-        default_marker = " (default)" if device.is_default else ""
+        if direction == DeviceDirection.INPUT:
+            default_marker = " (default)" if device.is_default_input else ""
+            channels_str = f"Channels: {device.input_channels}"
+        else:
+            default_marker = " (default)" if device.is_default_output else ""
+            channels_str = f"Channels: {device.output_channels}"
+
         print(
             f"  [{device.index}] {device.name}{default_marker}\n"
-            f"       Channels: {device.output_channels}, "
+            f"       {channels_str}, "
             f"Sample rate: {device.sample_rate} Hz"
         )
     if devices:
@@ -123,9 +132,9 @@ def list_audio_devices() -> None:
         print(f"  sendspin daemon --audio-device {devices[0].index}")
 
     if sys.platform.startswith("linux"):
-        alsa_devices = list_alsa_devices()
+        alsa_devices = list_alsa_devices(direction=direction)
         if alsa_devices:
-            print("\nALSA devices (use by name with --audio-device):")
+            print(f"\nALSA {dir_title} devices (use by name with --audio-device):")
             print()
             for name, description in alsa_devices:
                 print(f"  {name}")
@@ -255,6 +264,53 @@ def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bo
             "Restricts discovery to servers on the specified interface only. "
             "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
         ),
+    )
+    target.add_argument(
+        "--input",
+        "--source",
+        "--enable-source",
+        dest="source_enabled",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress_defaults else False,
+        help="Enable audio input streaming mode (source@v1 role) and disable player features",
+    )
+    target.add_argument(
+        "--input-device",
+        "--source-device",
+        dest="source_device",
+        type=str,
+        default=default,
+        help=(
+            "Audio input device for capture by index (e.g., 0, 1), name prefix, "
+            "or raw ALSA device name. Use 'sendspin audio-devices list --input' to see devices."
+        ),
+    )
+    target.add_argument(
+        "--source-codec",
+        type=str,
+        choices=["flac", "opus", "pcm"],
+        default=default,
+        help="Audio codec for source streaming (default: flac)",
+    )
+    target.add_argument(
+        "--source-rate",
+        type=int,
+        dest="source_sample_rate",
+        default=default,
+        help="Sample rate in Hz for source audio capture (default: 48000)",
+    )
+    target.add_argument(
+        "--source-channels",
+        type=int,
+        default=default,
+        help="Number of audio channels for source capture (default: 2)",
+    )
+    target.add_argument(
+        "--source-bit-depth",
+        type=int,
+        choices=[16, 24, 32],
+        default=default,
+        help="Bit depth for source audio capture (default: 16)",
     )
 
 
@@ -493,6 +549,52 @@ def _build_parser() -> argparse.ArgumentParser:
             "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
         ),
     )
+    daemon_parser.add_argument(
+        "--input",
+        "--source",
+        "--enable-source",
+        dest="source_enabled",
+        action="store_true",
+        help="Enable audio input streaming mode (source@v1 role) and disable player features",
+    )
+    daemon_parser.add_argument(
+        "--input-device",
+        "--source-device",
+        dest="source_device",
+        type=str,
+        default=None,
+        help=(
+            "Audio input device for capture by index (e.g., 0, 1), name prefix, "
+            "or raw ALSA device name. Use 'sendspin audio-devices list --input' to see devices."
+        ),
+    )
+    daemon_parser.add_argument(
+        "--source-codec",
+        type=str,
+        choices=["flac", "opus", "pcm"],
+        default=None,
+        help="Audio codec for source streaming (default: flac)",
+    )
+    daemon_parser.add_argument(
+        "--source-rate",
+        type=int,
+        dest="source_sample_rate",
+        default=None,
+        help="Sample rate in Hz for source audio capture (default: 48000)",
+    )
+    daemon_parser.add_argument(
+        "--source-channels",
+        type=int,
+        default=None,
+        help="Number of audio channels for source capture (default: 2)",
+    )
+    daemon_parser.add_argument(
+        "--source-bit-depth",
+        type=int,
+        choices=[16, 24, 32],
+        default=None,
+        help="Bit depth for source audio capture (default: 16)",
+    )
 
     # audio-devices subcommand
     audio_devices_parser = subparsers.add_parser(
@@ -505,11 +607,27 @@ def _build_parser() -> argparse.ArgumentParser:
         title="Commands",
         required=True,
     )
-    audio_devices_sub.add_parser(
+    list_parser = audio_devices_sub.add_parser(
         "list",
-        help="List available audio output devices",
-        description="List all available audio output devices and exit.",
+        help="List available audio devices",
+        description="List available audio devices and exit.",
     )
+    direction_group = list_parser.add_mutually_exclusive_group()
+    direction_group.add_argument(
+        "--input",
+        dest="direction",
+        action="store_const",
+        const="input",
+        help="List only input (capture) devices",
+    )
+    direction_group.add_argument(
+        "--output",
+        dest="direction",
+        action="store_const",
+        const="output",
+        help="List only output (playback) devices (default)",
+    )
+    list_parser.set_defaults(direction="output")
 
     # servers subcommand
     servers_parser = subparsers.add_parser(
@@ -704,10 +822,11 @@ async def _run_serve_mode(args: argparse.Namespace) -> int:
 async def _run_daemon_mode(
     args: argparse.Namespace,
     settings: ClientSettings,
-    audio_device: AudioDevice,
+    audio_device: AudioDevice | None,
     volume_controller: VolumeController | None,
     identity: Identity,
     pairing_store: ClientPairingStore,
+    source_device: AudioDevice | None = None,
 ) -> int:
     """Run the client in daemon mode (no UI)."""
     from sendspin.daemon.daemon import DaemonArgs, SendspinDaemon
@@ -724,13 +843,24 @@ async def _run_daemon_mode(
         static_delay_ms=args.static_delay_ms,
         listen_port=args.listen_port,
         use_mpris=args.use_mpris,
-        preferred_format=_resolve_preferred_format(args.audio_format, audio_device),
+        preferred_format=(
+            _resolve_preferred_format(args.audio_format, audio_device)
+            if audio_device is not None
+            else None
+        ),
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,
         manufacturer=args.manufacturer,
         product_name=args.product_name,
         interface=args.interface,
+        player_enabled=args.player_enabled,
+        source_enabled=args.source_enabled,
+        source_device=source_device,
+        source_codec=args.source_codec,
+        source_sample_rate=args.source_sample_rate,
+        source_channels=args.source_channels,
+        source_bit_depth=args.source_bit_depth,
     )
 
     daemon = SendspinDaemon(daemon_args)
@@ -757,7 +887,13 @@ def main() -> int:
     # Handle utility subcommands
     if args.command == "audio-devices":
         if args.audio_devices_command == "list":
-            list_audio_devices()
+            from sendspin.audio_devices import DeviceDirection
+
+            direction_val = getattr(args, "direction", "output")
+            direction = (
+                DeviceDirection(direction_val) if isinstance(direction_val, str) else direction_val
+            )
+            list_audio_devices(direction=direction)
             return 0
 
     if args.command == "servers":
@@ -866,6 +1002,29 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
     if args.interface is None:
         args.interface = settings.interface
 
+    # Source settings
+    if not getattr(args, "source_enabled", False):
+        if settings.source_enabled:
+            args.source_enabled = True
+        elif getattr(args, "source_device", None) is not None:
+            args.source_enabled = True
+        else:
+            args.source_enabled = False
+
+    player_enabled = not args.source_enabled
+    args.player_enabled = player_enabled
+
+    if getattr(args, "source_device", None) is None:
+        args.source_device = settings.source_audio_device
+    if getattr(args, "source_codec", None) is None:
+        args.source_codec = settings.source_codec or "flac"
+    if getattr(args, "source_sample_rate", None) is None:
+        args.source_sample_rate = settings.source_sample_rate or 48000
+    if getattr(args, "source_channels", None) is None:
+        args.source_channels = settings.source_channels or 2
+    if getattr(args, "source_bit_depth", None) is None:
+        args.source_bit_depth = settings.source_bit_depth or 16
+
     # Set up logging: daemon uses stderr, TUI writes to sendspin.log
     # so log output doesn't interfere with the Rich display.
     log_level = getattr(logging, args.log_level)
@@ -878,39 +1037,54 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logging.basicConfig(level=log_level, handlers=[handler])
 
-    audio_device = resolve_audio_device(args.audio_device)
+    from sendspin.audio_devices import DeviceDirection
+
+    audio_device: AudioDevice | None = None
+    if player_enabled:
+        audio_device = resolve_audio_device(args.audio_device)
+
+    source_device: AudioDevice | None = None
+    if args.source_enabled:
+        source_device = resolve_audio_device(args.source_device, DeviceDirection.INPUT)
 
     volume_controller: VolumeController | None = None
-    if args.hook_set_volume:
-        LOGGER.info("Using hook-based external volume control via %s", args.hook_set_volume)
-        volume_controller = HookVolumeController(args.hook_set_volume, settings)
-    elif args.hardware_volume:
-        # Try ALSA direct control first (works for hw: devices without PulseAudio).
-        alsa_info = await alsa_volume_check_available(audio_device)
-        if alsa_info is not None:
-            card, element = alsa_info
-            LOGGER.info(
-                "Using ALSA mixer volume control: card %d, element %r",
-                card,
-                element,
-            )
-            volume_controller = AlsaVolumeController(card=card, element=element)
-        elif await hw_volume_check_available(audio_device):
-            # Fall back to PulseAudio for virtual devices or when ALSA has no mixer.
-            volume_controller = HardwareVolumeController(audio_device)
-        else:
-            LOGGER.warning(
-                "No volume control available for device %r "
-                "(no ALSA mixer controls and PulseAudio/PipeWire not reachable), "
-                "falling back to software volume control",
-                audio_device.name,
-            )
-            args.hardware_volume = False
+    if player_enabled and audio_device is not None:
+        if args.hook_set_volume:
+            LOGGER.info("Using hook-based external volume control via %s", args.hook_set_volume)
+            volume_controller = HookVolumeController(args.hook_set_volume, settings)
+        elif args.hardware_volume:
+            # Try ALSA direct control first (works for hw: devices without PulseAudio).
+            alsa_info = await alsa_volume_check_available(audio_device)
+            if alsa_info is not None:
+                card, element = alsa_info
+                LOGGER.info(
+                    "Using ALSA mixer volume control: card %d, element %r",
+                    card,
+                    element,
+                )
+                volume_controller = AlsaVolumeController(card=card, element=element)
+            elif await hw_volume_check_available(audio_device):
+                # Fall back to PulseAudio for virtual devices or when ALSA has no mixer.
+                volume_controller = HardwareVolumeController(audio_device)
+            else:
+                LOGGER.warning(
+                    "No volume control available for device %r "
+                    "(no ALSA mixer controls and PulseAudio/PipeWire not reachable), "
+                    "falling back to software volume control",
+                    audio_device.name,
+                )
+                args.hardware_volume = False
 
     # Handle daemon subcommand
     if args.command == "daemon":
         return await _run_daemon_mode(
-            args, settings, audio_device, volume_controller, identity, pairing_store
+            args,
+            settings,
+            audio_device,
+            volume_controller,
+            identity,
+            pairing_store,
+            source_device=source_device,
         )
 
     from sendspin.tui.app import AppArgs, SendspinApp
@@ -927,13 +1101,24 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         settings=settings,
         static_delay_ms=args.static_delay_ms,
         use_mpris=args.use_mpris,
-        preferred_format=_resolve_preferred_format(args.audio_format, audio_device),
+        preferred_format=(
+            _resolve_preferred_format(args.audio_format, audio_device)
+            if audio_device is not None
+            else None
+        ),
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,
         manufacturer=args.manufacturer,
         product_name=args.product_name,
         interface=args.interface,
+        player_enabled=player_enabled,
+        source_enabled=args.source_enabled,
+        source_device=source_device,
+        source_codec=args.source_codec,
+        source_sample_rate=args.source_sample_rate,
+        source_channels=args.source_channels,
+        source_bit_depth=args.source_bit_depth,
     )
 
     app = SendspinApp(app_args)

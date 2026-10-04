@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from enum import Enum
 from urllib.parse import urlparse
@@ -158,6 +157,16 @@ class UIState:
     # progress. None when not pairing.
     pairing_code: str | None = None
 
+    # Source capture (source@v1)
+    player_enabled: bool = True
+    source_enabled: bool = False
+    source_device_name: str | None = None
+    source_streaming: bool = False
+    source_codec: str | None = None
+    source_sample_rate: int = 0
+    source_bit_depth: int = 0
+    source_channels: int = 0
+
 
 class SendspinUI:
     """Rich-based terminal UI for the Sendspin CLI."""
@@ -166,12 +175,19 @@ class SendspinUI:
         self,
         delay_ms: float,
         *,
+        player_enabled: bool = True,
         player_volume: int = 100,
         player_muted: bool = False,
         use_external_volume: bool = False,
         visualizer_enabled: bool = False,
         color_mode: ColorMode = ColorMode.DARK,
         on_color_mode_change: Callable[[ColorMode], None] | None = None,
+        source_enabled: bool = False,
+        source_device_name: str | None = None,
+        source_codec: str | None = None,
+        source_sample_rate: int = 0,
+        source_bit_depth: int = 0,
+        source_channels: int = 0,
     ) -> None:
         """Initialize the UI."""
         self._console = Console()
@@ -181,11 +197,18 @@ class SendspinUI:
         self._state = UIState(
             delay_ms=delay_ms,
             volume=player_volume,
+            player_enabled=player_enabled,
             player_volume=player_volume,
             player_muted=player_muted,
             use_external_volume=use_external_volume,
             visualizer_enabled=visualizer_enabled,
             color_mode=color_mode,
+            source_enabled=source_enabled,
+            source_device_name=source_device_name,
+            source_codec=source_codec,
+            source_sample_rate=source_sample_rate,
+            source_bit_depth=source_bit_depth,
+            source_channels=source_channels,
         )
         self._live: Live | None = None
         self._running = False
@@ -227,20 +250,25 @@ class SendspinUI:
     def _needs_playback_refresh(self) -> bool:
         """Check if the progress panel needs periodic refreshes."""
         return (
-            self._state.playback_state == PlaybackStateType.PLAYING
+            self._state.player_enabled
+            and self._state.playback_state == PlaybackStateType.PLAYING
             and self._state.progress_updated_at > 0
             and (self._state.track_duration_ms or 0) > 0
         )
 
     def _needs_visualizer_refresh(self) -> bool:
         """Check if the visualizer needs periodic refreshes for interpolation."""
-        if not self._state.visualizer_enabled:
+        if not self._state.player_enabled or not self._state.visualizer_enabled:
             return False
         return (
             self._state.visualizer_state.is_active
             or self._state.beat_state.is_active
             or self._state.peak_state.is_active
         )
+
+    def _needs_vu_refresh(self) -> bool:
+        """Check if the source VU meter needs periodic refreshes."""
+        return not self._state.player_enabled and self._state.source_streaming
 
     def _next_refresh_interval(self) -> float | None:
         """Return the next periodic refresh interval, if any."""
@@ -251,6 +279,8 @@ class SendspinUI:
             intervals.append(HIGHLIGHT_REFRESH_INTERVAL)
         if self._needs_visualizer_refresh():
             intervals.append(VISUALIZER_REFRESH_INTERVAL)
+        if self._needs_vu_refresh():
+            intervals.append(0.05)
         return min(intervals) if intervals else None
 
     def _flush_refresh(self, *, force: bool = False) -> None:
@@ -792,6 +822,39 @@ class SendspinUI:
 
         return self._make_panel(content, title="Stream", default_border="yellow", expand=expand)
 
+    def _build_source_stream_panel(self, *, expand: bool = False, min_info_rows: int = 0) -> Panel:
+        """Build the source streaming status panel."""
+        info = Table.grid(padding=(0, 1))
+        info.add_column(style=self._themed("dim"))
+        info.add_column()
+
+        status_text = (
+            Text("Streaming", style=self._themed("green bold"))
+            if self._state.source_streaming
+            else Text("Idle", style=self._themed("yellow"))
+        )
+        info.add_row("Status:", status_text)
+        device_name = self._state.source_device_name or "Default"
+        info.add_row("Device:", Text(device_name, style=self._themed("cyan")))
+        codec_label = (self._state.source_codec or "FLAC").upper()
+        info.add_row("Codec:", Text(codec_label, style=self._themed("cyan")))
+        rate_khz = (self._state.source_sample_rate or 48000) / 1000
+        info.add_row("Rate:", Text(f"{rate_khz:.1f}kHz", style=self._themed("cyan")))
+        depth_val = self._state.source_bit_depth or 16
+        info.add_row("Depth:", Text(f"{depth_val}bit", style=self._themed("cyan")))
+        ch_count = self._state.source_channels or 2
+        ch_label = "Stereo" if ch_count == 2 else ("Mono" if ch_count == 1 else f"{ch_count}ch")
+        info.add_row("Channels:", Text(ch_label, style=self._themed("cyan")))
+        info_rows = 6
+
+        content = Table.grid()
+        content.add_column()
+        content.add_row(info)
+        for _ in range(max(0, min_info_rows - info_rows)):
+            content.add_row("")
+
+        return self._make_panel(content, title="Stream", default_border="yellow", expand=expand)
+
     def _build_server_panel(self, *, expand: bool = False, min_info_rows: int = 0) -> Panel:
         """Build the server panel."""
         info = Table.grid(padding=(0, 1))
@@ -808,9 +871,13 @@ class SendspinUI:
             if port:
                 info.add_row("Port:", Text(port, style=self._themed("cyan")))
             info.add_row("Path:", Text(path, style=self._themed("cyan")))
-            if self._state.group_name:
+            if self._state.player_enabled and self._state.group_name:
                 info.add_row("Group:", Text(self._state.group_name, style=self._themed("cyan")))
-            info_rows = 3 + (1 if port else 0) + (1 if self._state.group_name else 0)
+            info_rows = (
+                3
+                + (1 if port else 0)
+                + (1 if (self._state.player_enabled and self._state.group_name) else 0)
+            )
         else:
             info.add_row("Status:", Text("Disconnected", style=self._themed("red bold")))
             info.add_row("Host:", Text(self._state.status_message, style=self._themed("yellow")))
@@ -822,10 +889,11 @@ class SendspinUI:
         for _ in range(max(0, min_info_rows - info_rows)):
             content.add_row("")
         # Shortcuts
-        shortcut_group = Text()
-        shortcut_group.append("g", style=self._shortcut_style("switch"))
-        shortcut_group.append(" change group", style=self._themed("dim"))
-        content.add_row(shortcut_group)
+        if self._state.player_enabled:
+            shortcut_group = Text()
+            shortcut_group.append("g", style=self._shortcut_style("switch"))
+            shortcut_group.append(" change group", style=self._themed("dim"))
+            content.add_row(shortcut_group)
         shortcut_server = Text()
         shortcut_server.append("s", style=self._shortcut_style("server"))
         shortcut_server.append(" change server", style=self._themed("dim"))
@@ -1103,6 +1171,54 @@ class SendspinUI:
 
         narrow = width < 80
 
+        if not self._state.player_enabled:
+            stream = self._cached_panel(
+                "source_stream",
+                (
+                    narrow,
+                    self._state.source_streaming,
+                    self._state.source_device_name,
+                    self._state.source_codec,
+                    self._state.source_sample_rate,
+                    self._state.source_bit_depth,
+                    self._state.source_channels,
+                ),
+                lambda: self._build_source_stream_panel(expand=True),
+            )
+            server = self._cached_panel(
+                "server",
+                (
+                    narrow,
+                    self._state.connected,
+                    self._state.server_url,
+                    self._state.status_message,
+                    self._state.group_name,
+                    self._state.player_enabled,
+                    self._is_highlighted("server"),
+                ),
+                lambda: self._build_server_panel(expand=True),
+            )
+
+            if narrow:
+                layout.add_row(stream)
+                layout.add_row(server)
+            else:
+                streaming_row = Table.grid(expand=True)
+                streaming_row.add_column(ratio=1)
+                streaming_row.add_column(ratio=1)
+                streaming_row.add_row(stream, server)
+                layout.add_row(streaming_row)
+
+            quit_line = Text(justify="right", style=layout_style or "")
+            if self._palette_active():
+                target = "light" if self._state.color_mode == ColorMode.DARK else "dark"
+                quit_line.append("t", style=self._shortcut_style("theme"))
+                quit_line.append(f" {target} theme  ", style=self._themed("dim"))
+            quit_line.append("q", style=self._shortcut_style("quit"))
+            quit_line.append(" quit  ", style=self._themed("dim"))
+            layout.add_row(quit_line)
+            return layout
+
         # Now Playing panel
         now_playing = self._cached_panel(
             "now_playing",
@@ -1187,6 +1303,7 @@ class SendspinUI:
                 self._state.server_url,
                 self._state.status_message,
                 self._state.group_name,
+                self._state.player_enabled,
                 self._is_highlighted("switch"),
                 self._is_highlighted("server"),
             ),
@@ -1473,6 +1590,39 @@ class SendspinUI:
         if 0 <= self._state.selected_server_index < len(self._state.available_servers):
             return self._state.available_servers[self._state.selected_server_index]
         return None
+
+    def set_source_streaming(self, streaming: bool) -> None:
+        """Update source streaming state."""
+        self._state.source_streaming = streaming
+        self.refresh()
+
+    def set_source_info(
+        self,
+        *,
+        enabled: bool | None = None,
+        streaming: bool | None = None,
+        device_name: str | None = None,
+        codec: str | None = None,
+        sample_rate: int | None = None,
+        bit_depth: int | None = None,
+        channels: int | None = None,
+    ) -> None:
+        """Update source configuration and streaming information."""
+        if enabled is not None:
+            self._state.source_enabled = enabled
+        if streaming is not None:
+            self._state.source_streaming = streaming
+        if device_name is not None:
+            self._state.source_device_name = device_name
+        if codec is not None:
+            self._state.source_codec = codec
+        if sample_rate is not None:
+            self._state.source_sample_rate = sample_rate
+        if bit_depth is not None:
+            self._state.source_bit_depth = bit_depth
+        if channels is not None:
+            self._state.source_channels = channels
+        self.refresh()
 
     def start(self) -> None:
         """Start the live display."""
